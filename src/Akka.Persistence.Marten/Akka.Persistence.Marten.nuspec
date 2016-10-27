@@ -2,7 +2,7 @@
 <package >
   <metadata>
     <id>Akka.Persistence.Marten</id>
-    <version>1.1.0-beta</version>
+    <version>1.0.0-beta</version>
     <title>Akka.Persistence.Marten</title>
     <authors>Daniel Söderberg</authors>
     <owners>Daniel Söderberg</owners>
