@@ -7,6 +7,7 @@ using Akka.Actor;
 using Akka.Persistence.Journal;
 using Akka.Util.Internal;
 using Marten;
+using Marten.Events;
 
 namespace Akka.Persistence.Marten.Journal
 {
@@ -34,18 +35,20 @@ namespace Akka.Persistence.Marten.Journal
         {
             using (var session = _documentStore.Value.LightweightSession())
             {
-                var documents = await session.Query<JournalEntry>()
-                .Where(x => x.IsDeleted == false)
-                .Where(x => x.PersistenceId.Equals(persistenceId))
-                .Where(x => x.SequenceNr >= fromSequenceNr)
-                .Where(x => x.SequenceNr <= toSequenceNr)
-                .OrderBy(x => x.SequenceNr)
-                .ToListAsync();
+                var streamId = await session.Query<MetadataEntry>()
+                    .Where(m => m.Id == persistenceId)
+                    .Select(m => m.StreamId)
+                    .FirstAsync();
 
-                documents.ForEach(doc =>
-                {
-                    recoveryCallback(new Persistent(doc.Payload, doc.SequenceNr, doc.PersistenceId, doc.Manifest, doc.IsDeleted, context.Sender));
-                });
+                var docs = await session.Events.QueryAllRawEvents()
+                    .Where(e => e.StreamId == streamId && e.Version >= fromSequenceNr && e.Version <= toSequenceNr)
+                    .Take(max > int.MaxValue ? int.MaxValue : (int) max)
+                    .ToListAsync();
+
+                docs
+                    .ForEach(e =>
+                            recoveryCallback(new Persistent(e.Data, e.Version, persistenceId, null, false,
+                                context.Sender)));
             }
         }
 
@@ -53,92 +56,73 @@ namespace Akka.Persistence.Marten.Journal
         {
             using (var session = _documentStore.Value.LightweightSession())
             {
-                var highSeqNr = await session.Query<MetadataEntry>()
-               .Where(x => x.PersistenceId.Equals(persistenceId))
-               .OrderByDescending(x => x.SequenceNr)
-               .Select(x => x.SequenceNr)
-               .FirstOrDefaultAsync();
+                var streamId = await session.Query<MetadataEntry>()
+                    .Where(m => m.Id == persistenceId)
+                    .Select(m => m.StreamId)
+                    .FirstOrDefaultAsync();
 
-                return highSeqNr;
-            }            
+                if (streamId == default(Guid))
+                    return 0;
+
+                var cmd = session.Connection.CreateCommand();
+                cmd.CommandText = $"SELECT version FROM public.mt_streams where id = '{streamId}'";
+                return (int) await cmd.ExecuteScalarAsync();
+            }   
         }
 
-        protected override async Task<IImmutableList<Exception>> WriteMessagesAsync(IEnumerable<global::Akka.Persistence.AtomicWrite> messages)
+        protected override async Task<IImmutableList<Exception>> WriteMessagesAsync(IEnumerable<AtomicWrite> messages)
         {
-            
-            var messageList = messages.ToList();
-            var writeTasks = messageList.Select(async message =>
-            {
-                var persistentMessages = ((IImmutableList<IPersistentRepresentation>) message.Payload).ToArray();
-
-                var journalEntries = persistentMessages.ToList();
-
-                var entries = journalEntries.Select(x => new JournalEntry()
+            var msg = messages.ToList();
+            var tasks = msg.GroupBy(a => a.PersistenceId)
+                .Select(async writes =>
                 {
-                    Id = x.PersistenceId + "_" + x.SequenceNr,
-                    IsDeleted = x.IsDeleted,
-                    Payload = x.Payload,
-                    PersistenceId = x.PersistenceId,
-                    SequenceNr = x.SequenceNr,
-                    Manifest = x.Manifest
-                });
-
-                using (var session = _documentStore.Value.LightweightSession())
-                {
-                    foreach (var entry in entries)
+                    using (var session = _documentStore.Value.LightweightSession())
                     {
-                        session.Store(entry);
+                        var events = writes
+                            .SelectMany(c => (IImmutableList<IPersistentRepresentation>) c.Payload)
+                            .Select(c => c.Payload)
+                            .ToArray();
+
+                        var metadataEntry = await session.Query<MetadataEntry>()
+                            .Where(m => m.Id == writes.Key)
+                            .FirstOrDefaultAsync();
+
+                        if (metadataEntry == null)
+                        {
+                            metadataEntry = new MetadataEntry
+                            {
+                                Id = writes.Key,
+                                StreamId = Guid.NewGuid()
+                            };
+                            session.Store(metadataEntry);
+                            session.Events.StartStream<object>(metadataEntry.StreamId, events);
+                        }
+                        else
+                            session.Events.Append(metadataEntry.StreamId, events);
+
+                        await session.SaveChangesAsync();
                     }
+                }).Select(task => task.ContinueWith(t => t.IsFaulted ? TryUnwrapException(t.Exception) : null));
 
-                    await session.SaveChangesAsync();
-                }
-            });
-
-            await UpdatedHighestSeqNr(messageList);
-
-            return await Task<IImmutableList<Exception>>
-                .Factory
-                .ContinueWhenAll(writeTasks.ToArray(),
-                    tasks => tasks.Select(t => t.IsFaulted ? TryUnwrapException(t.Exception) : null).ToImmutableList());
+            var result = await Task.WhenAll(tasks).ContinueWith(t => (IImmutableList<Exception>) t.Result.ToImmutableList());
+            return msg.Count == 1
+                ? result
+                : result.AddRange(Enumerable.Range(1, msg.Count-1).Select(_ => null as Exception));
         }
 
         protected override async Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr)
         {
             using (var session = _documentStore.Value.LightweightSession())
             {
-                var entries = await session.Query<JournalEntry>()
-                    .Where(x => x.PersistenceId.Equals(persistenceId))
-                    .Where(x => x.SequenceNr <= toSequenceNr)
-                    .ToListAsync();
+                var streamId = await session.Query<MetadataEntry>()
+                    .Where(m => m.Id == persistenceId)
+                    .Select(m => m.StreamId)
+                    .FirstAsync();
 
-                if (_settings.UseSoftDelete)
-                {
-                    entries.ForEach(x => x.IsDeleted = true);
-                }
-
-                session.StoreObjects(entries);
-                
-                await session.SaveChangesAsync();
+                var deleteCmd = session.Connection.CreateCommand();
+                deleteCmd.CommandText = $"DELETE FROM public.mt_events where stream_id = '{streamId}' and version <= {toSequenceNr}";
+                await deleteCmd.ExecuteNonQueryAsync();
             }
-        }
-
-        private async Task UpdatedHighestSeqNr(List<global::Akka.Persistence.AtomicWrite> messageList)
-        {
-            var persistenceId = messageList.Select(c => c.PersistenceId).First();
-            var highSequenceId = messageList.Max(c => c.HighestSequenceNr);
-
-            var metadataEntry = new MetadataEntry
-            {
-                Id = persistenceId,
-                PersistenceId = persistenceId,
-                SequenceNr = highSequenceId
-            };
-
-            using (var session = _documentStore.Value.LightweightSession())
-            {
-                session.Store(metadataEntry);
-                await session.SaveChangesAsync();
-            } 
         }
     }
 }

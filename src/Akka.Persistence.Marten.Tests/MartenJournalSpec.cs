@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Configuration;
 using Akka.Persistence.TestKit.Journal;
+using Baseline.Reflection;
+using Marten;
 using Xunit;
 
 namespace Akka.Persistence.Marten.Tests
@@ -44,8 +46,22 @@ namespace Akka.Persistence.Marten.Tests
         }
 
         protected override void Dispose(bool disposing)
-        {   
-            base.Dispose(disposing);
+        {
+            using (var connection = new Npgsql.NpgsqlConnection(_connectionString))
+            {
+                connection.Open();
+
+                var deleteCmd = connection.CreateCommand();
+                deleteCmd.CommandText = "DELETE FROM public.mt_streams";
+                deleteCmd.ExecuteNonQuery();
+
+
+                deleteCmd = connection.CreateCommand();
+                deleteCmd.CommandText = "DELETE FROM public.mt_doc_metadataentry";
+                deleteCmd.ExecuteNonQuery();
+
+                connection.Close();
+            }
         }
     }
 }
